@@ -7,7 +7,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table},
 };
-use std::{cmp::Ordering, error::Error, io, process::Command};
+use std::{cmp::Ordering, error::Error, fs, io, path::PathBuf, process::Command};
 use sysinfo::*;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -40,9 +40,24 @@ struct AppState {
     processes: Vec<ProcessInfo>,
     networks: Vec<NetworkInfo>,
     ports: Vec<PortInfo>,
+    all_ports: Vec<PortInfo>, // Store unfiltered ports
     files: Vec<FileInfo>,
     services: Vec<ServiceInfo>,
     system_info: SystemInfo,
+    current_path: PathBuf, // Current directory for file browser
+    port_filter: String,   // Filter text for ports
+    port_filter_mode: bool, // Whether we're in filter input mode
+    command_line: String,  // Embedded command line input
+    command_mode: bool,    // Whether we're in command input mode
+    file_operation: Option<FileOperation>, // Current file operation state
+    message: String,       // Status message to display
+}
+
+#[derive(Clone)]
+enum FileOperation {
+    Copy(String),  // Source file path
+    Move(String),  // Source file path
+    Delete(String), // File path to delete
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -81,6 +96,7 @@ struct PortInfo {
     process: String,
     local_address: String,
     state: String,
+    pid: String, // Add PID for kill by port functionality
 }
 
 #[derive(Clone)]
@@ -116,6 +132,7 @@ impl AppState {
             processes: Vec::new(),
             networks: Vec::new(),
             ports: Vec::new(),
+            all_ports: Vec::new(),
             files: Vec::new(),
             services: Vec::new(),
             system_info: SystemInfo {
@@ -124,6 +141,13 @@ impl AppState {
                 cpu_count: 0,
                 os_version: "Unknown".to_string(),
             },
+            current_path: PathBuf::from("/"),
+            port_filter: String::new(),
+            port_filter_mode: false,
+            command_line: String::new(),
+            command_mode: false,
+            file_operation: None,
+            message: String::new(),
         };
         app.refresh_data();
         app
@@ -189,17 +213,41 @@ impl AppState {
     fn refresh_ports(&mut self) {
         let output = Command::new("lsof").args(["-i", "-P", "-n"]).output().ok();
 
-        self.ports = output
+        self.all_ports = output
             .as_ref()
             .map(|output| String::from_utf8_lossy(&output.stdout))
             .map(|output| output.lines().skip(1).filter_map(parse_lsof_line).collect())
             .unwrap_or_default();
 
+        self.apply_port_filter();
+    }
+
+    fn apply_port_filter(&mut self) {
+        if self.port_filter.is_empty() {
+            self.ports = self.all_ports.clone();
+        } else {
+            let filter_lower = self.port_filter.to_lowercase();
+            self.ports = self
+                .all_ports
+                .iter()
+                .filter(|port| {
+                    port.port.to_lowercase().contains(&filter_lower)
+                        || port.process.to_lowercase().contains(&filter_lower)
+                        || port.protocol.to_lowercase().contains(&filter_lower)
+                        || port.local_address.to_lowercase().contains(&filter_lower)
+                })
+                .cloned()
+                .collect();
+        }
         self.clamp_selected_index();
     }
 
     fn refresh_files(&mut self) {
-        let output = Command::new("ls").args(["-la", "/tmp"]).output().ok();
+        let path_str = self.current_path.to_string_lossy().to_string();
+        let output = Command::new("ls")
+            .args(["-la", &path_str])
+            .output()
+            .ok();
 
         self.files = output
             .as_ref()
@@ -207,7 +255,40 @@ impl AppState {
             .map(|output| output.lines().skip(1).filter_map(parse_ls_line).collect())
             .unwrap_or_default();
 
+        // Add parent directory entry if not at root
+        if self.current_path != PathBuf::from("/") {
+            let parent = FileInfo {
+                name: "..".to_string(),
+                size: "DIR".to_string(),
+                date: "".to_string(),
+                permissions: "d".to_string(),
+                is_directory: true,
+            };
+            self.files.insert(0, parent);
+        }
+
         self.clamp_selected_index();
+    }
+
+    fn navigate_into_directory(&mut self) {
+        if let Some(file) = self.files.get(self.selected_index) {
+            if file.is_directory {
+                if file.name == ".." {
+                    // Go to parent directory
+                    if let Some(parent) = self.current_path.parent() {
+                        self.current_path = parent.to_path_buf();
+                    }
+                } else {
+                    // Navigate into directory
+                    let new_path = self.current_path.join(&file.name);
+                    if new_path.is_dir() {
+                        self.current_path = new_path;
+                    }
+                }
+                self.selected_index = 0;
+                self.refresh_files();
+            }
+        }
     }
 
     fn refresh_services(&mut self) {
@@ -250,6 +331,132 @@ impl AppState {
             Tab::System => 6,
             Tab::Tools => 8,
             _ => 0,
+        }
+    }
+
+    fn kill_process_by_port(&mut self) {
+        if let Some(port) = self.ports.get(self.selected_index) {
+            if !port.pid.is_empty() && port.pid != "-" {
+                let _ = Command::new("kill").arg("-9").arg(&port.pid).output();
+                self.refresh_ports();
+            }
+        }
+    }
+
+    fn copy_file(&mut self) {
+        if let Some(file) = self.files.get(self.selected_index) {
+            if file.name != ".." {
+                let source_path = self.current_path.join(&file.name);
+                self.file_operation = Some(FileOperation::Copy(source_path.to_string_lossy().to_string()));
+                self.message = format!("Copy: {} -> Enter destination path", file.name);
+            }
+        }
+    }
+
+    fn move_file(&mut self) {
+        if let Some(file) = self.files.get(self.selected_index) {
+            if file.name != ".." {
+                let source_path = self.current_path.join(&file.name);
+                self.file_operation = Some(FileOperation::Move(source_path.to_string_lossy().to_string()));
+                self.message = format!("Move: {} -> Enter destination path", file.name);
+            }
+        }
+    }
+
+    fn delete_file(&mut self) {
+        if let Some(file) = self.files.get(self.selected_index) {
+            if file.name != ".." {
+                let file_path = self.current_path.join(&file.name);
+                self.file_operation = Some(FileOperation::Delete(file_path.to_string_lossy().to_string()));
+                self.message = format!("Delete: {}? (y/n)", file.name);
+            }
+        }
+    }
+
+    fn execute_file_operation(&mut self, destination: &str) {
+        match &self.file_operation {
+            Some(FileOperation::Copy(source)) => {
+                let src = PathBuf::from(source);
+                let dst = PathBuf::from(destination);
+                match fs::copy(&src, &dst) {
+                    Ok(_) => {
+                        self.message = format!("Copied {} to {}", src.display(), dst.display());
+                        self.file_operation = None;
+                        self.refresh_files();
+                    }
+                    Err(e) => {
+                        self.message = format!("Error copying file: {}", e);
+                    }
+                }
+            }
+            Some(FileOperation::Move(source)) => {
+                let src = PathBuf::from(source);
+                let dst = PathBuf::from(destination);
+                match fs::rename(&src, &dst) {
+                    Ok(_) => {
+                        self.message = format!("Moved {} to {}", src.display(), dst.display());
+                        self.file_operation = None;
+                        self.refresh_files();
+                    }
+                    Err(e) => {
+                        self.message = format!("Error moving file: {}", e);
+                    }
+                }
+            }
+            Some(FileOperation::Delete(path)) => {
+                let path_buf = PathBuf::from(path);
+                if path_buf.is_dir() {
+                    match fs::remove_dir_all(&path_buf) {
+                        Ok(_) => {
+                            self.message = format!("Deleted directory: {}", path);
+                            self.file_operation = None;
+                            self.refresh_files();
+                        }
+                        Err(e) => {
+                            self.message = format!("Error deleting directory: {}", e);
+                        }
+                    }
+                } else {
+                    match fs::remove_file(&path_buf) {
+                        Ok(_) => {
+                            self.message = format!("Deleted file: {}", path);
+                            self.file_operation = None;
+                            self.refresh_files();
+                        }
+                        Err(e) => {
+                            self.message = format!("Error deleting file: {}", e);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn execute_command(&mut self) {
+        if !self.command_line.trim().is_empty() {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&self.command_line)
+                .output();
+
+            match output {
+                Ok(result) => {
+                    if result.status.success() {
+                        let stdout = String::from_utf8_lossy(&result.stdout);
+                        self.message = format!("Command executed. Output: {}", stdout.lines().take(3).collect::<Vec<_>>().join(" "));
+                    } else {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        self.message = format!("Command failed: {}", stderr.lines().next().unwrap_or("Unknown error"));
+                    }
+                }
+                Err(e) => {
+                    self.message = format!("Error executing command: {}", e);
+                }
+            }
+            self.command_line.clear();
+            self.command_mode = false;
+            self.refresh_data();
         }
     }
 
@@ -313,14 +520,103 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
         terminal.draw(|f| ui(f, &app_state))?;
 
         if let Event::Key(key) = event::read()? {
+            // Handle command mode or file operation input
+            if app_state.command_mode {
+                match key.code {
+                    KeyCode::Esc => {
+                        app_state.command_mode = false;
+                        app_state.command_line.clear();
+                        app_state.message.clear();
+                    }
+                    KeyCode::Enter => {
+                        app_state.execute_command();
+                    }
+                    KeyCode::Char(c) => {
+                        if c == '\x08' || c == '\x7f' {
+                            // Backspace
+                            app_state.command_line.pop();
+                        } else if !c.is_control() {
+                            app_state.command_line.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            } else if app_state.file_operation.is_some() {
+                // Handle file operation input
+                match key.code {
+                    KeyCode::Esc => {
+                        app_state.file_operation = None;
+                        app_state.message.clear();
+                    }
+                    KeyCode::Enter => {
+                        if let Some(FileOperation::Delete(_)) = app_state.file_operation {
+                            // For delete, we need 'y' confirmation
+                            continue;
+                        } else {
+                            // For copy/move, use current path or command_line as destination
+                            let dest = if app_state.command_line.is_empty() {
+                                app_state.current_path.to_string_lossy().to_string()
+                            } else {
+                                app_state.command_line.clone()
+                            };
+                            app_state.execute_file_operation(&dest);
+                            app_state.command_line.clear();
+                        }
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(FileOperation::Delete(path)) = app_state.file_operation.clone() {
+                            app_state.execute_file_operation(&path);
+                            app_state.command_line.clear();
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        if let Some(FileOperation::Delete(_)) = app_state.file_operation {
+                            app_state.file_operation = None;
+                            app_state.message.clear();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if c == '\x08' || c == '\x7f' {
+                            // Backspace
+                            app_state.command_line.pop();
+                        } else if !c.is_control() {
+                            app_state.command_line.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Normal mode key handling
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Char('h') => app_state.show_help = !app_state.show_help,
                 KeyCode::Char('r') => app_state.refresh_data(),
+                KeyCode::Char(':') => {
+                    // Enter command mode
+                    app_state.command_mode = true;
+                    app_state.command_line.clear();
+                    app_state.message = "Command: ".to_string();
+                }
                 KeyCode::Up => app_state.move_up(),
                 KeyCode::Down => app_state.move_down(),
                 KeyCode::Left => app_state.prev_tab(),
                 KeyCode::Right => app_state.next_tab(),
+                KeyCode::Tab => app_state.next_tab(),
+                KeyCode::Enter if app_state.current_tab == Tab::Files && app_state.file_operation.is_none() => {
+                    app_state.navigate_into_directory();
+                }
+                KeyCode::Char('c') if app_state.current_tab == Tab::Files && app_state.file_operation.is_none() => {
+                    app_state.copy_file();
+                }
+                KeyCode::Char('m') if app_state.current_tab == Tab::Files && app_state.file_operation.is_none() => {
+                    app_state.move_file();
+                }
+                KeyCode::Char('d') if app_state.current_tab == Tab::Files && app_state.file_operation.is_none() => {
+                    app_state.delete_file();
+                }
                 KeyCode::Char('k') if app_state.current_tab == Tab::Processes => {
                     if let Some(process) = app_state.processes.get(app_state.selected_index) {
                         let _ = Command::new("kill").arg("-9").arg(&process.pid).output();
@@ -331,6 +627,34 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                     if let Some(process) = app_state.processes.get(app_state.selected_index) {
                         let _ = Command::new("kill").arg("-TERM").arg(&process.pid).output();
                         app_state.refresh_processes();
+                    }
+                }
+                KeyCode::Char('k') if app_state.current_tab == Tab::Ports && !app_state.port_filter_mode => {
+                    app_state.kill_process_by_port();
+                }
+                KeyCode::Char('/') if app_state.current_tab == Tab::Ports => {
+                    // Enter filter mode
+                    app_state.port_filter_mode = true;
+                }
+                KeyCode::Esc if app_state.current_tab == Tab::Ports => {
+                    // Exit filter mode and clear filter
+                    app_state.port_filter_mode = false;
+                    app_state.port_filter.clear();
+                    app_state.apply_port_filter();
+                }
+                KeyCode::Char(c) if app_state.current_tab == Tab::Ports && app_state.port_filter_mode => {
+                    // Only filter when in filter mode
+                    if c == '\x08' || c == '\x7f' {
+                        // Backspace
+                        app_state.port_filter.pop();
+                        app_state.apply_port_filter();
+                    } else if c == '\r' || c == '\n' {
+                        // Enter to exit filter mode (keep filter active)
+                        app_state.port_filter_mode = false;
+                    } else if !c.is_control() {
+                        // Add character to filter
+                        app_state.port_filter.push(c);
+                        app_state.apply_port_filter();
                     }
                 }
                 KeyCode::Char('s') if app_state.current_tab == Tab::Services => {
@@ -367,13 +691,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
 }
 
 fn ui(f: &mut Frame, app_state: &AppState) {
+    // Determine if we need extra space for command line or file operation
+    let mut constraints = vec![
+        Constraint::Length(3), // Header
+        Constraint::Min(0),    // Main content
+    ];
+    
+    if app_state.command_mode || app_state.file_operation.is_some() {
+        constraints.push(Constraint::Length(3)); // Command/Operation input line
+    }
+    
+    constraints.push(Constraint::Length(3)); // Footer
+    
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(0),    // Main content
-            Constraint::Length(3), // Footer
-        ])
+        .constraints(constraints)
         .split(f.size());
 
     // Header
@@ -423,18 +755,42 @@ fn ui(f: &mut Frame, app_state: &AppState) {
         Tab::Settings => render_settings(f, main_chunks[1], app_state),
     }
 
-    // Footer
-    let footer_text = if app_state.show_help {
-        "Help: q=quit, h=toggle help, r=refresh, ↑↓=navigate, ←→=tabs, k=kill process, K=terminate, s=start service, S=stop service"
+    // Command line or file operation input
+    let mut footer_idx = 2;
+    if app_state.command_mode || app_state.file_operation.is_some() {
+        let input_text = if app_state.command_mode {
+            format!(":{}", app_state.command_line)
+        } else if let Some(FileOperation::Copy(_)) = app_state.file_operation {
+            format!("{} Destination: {}", app_state.message, app_state.command_line)
+        } else if let Some(FileOperation::Move(_)) = app_state.file_operation {
+            format!("{} Destination: {}", app_state.message, app_state.command_line)
+        } else if let Some(FileOperation::Delete(_)) = app_state.file_operation {
+            app_state.message.clone()
+        } else {
+            String::new()
+        };
+        
+        let input_widget = Paragraph::new(input_text)
+            .style(Style::default().fg(if app_state.command_mode { Color::Green } else { Color::Yellow }))
+            .block(Block::default().borders(Borders::ALL).title(if app_state.command_mode { "Command Line" } else { "File Operation" }));
+        f.render_widget(input_widget, chunks[2]);
+        footer_idx = 3;
+    }
+    
+    // Status message or footer
+    let footer_text = if !app_state.message.is_empty() && !app_state.command_mode && app_state.file_operation.is_none() {
+        app_state.message.clone()
+    } else if app_state.show_help {
+        "Help: q=quit, h=toggle help, r=refresh, : =command, ↑↓=navigate, ←→/Tab=tabs, Enter=open dir, c=copy, m=move, d=delete (Files), k=kill, K=terminate, s/S=start/stop service, /=filter (Ports)".to_string()
     } else {
-        "Press 'h' for help, 'q' to quit, 'r' to refresh, arrow keys to navigate"
+        "Press 'h' for help, 'q' to quit, ':' for command line, 'r' to refresh, arrow keys to navigate".to_string()
     };
 
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::Cyan))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[footer_idx]);
 }
 
 fn render_dashboard(f: &mut Frame, area: Rect, app_state: &AppState) {
@@ -505,7 +861,10 @@ fn render_files(f: &mut Frame, area: Rect, app_state: &AppState) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().title("Files (/tmp)").borders(Borders::ALL));
+    let path_str = app_state.current_path.to_string_lossy();
+    let title = format!("Files ({})", path_str);
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL));
     f.render_widget(list, area);
 }
 
@@ -604,16 +963,24 @@ fn render_ports(f: &mut Frame, area: Rect, app_state: &AppState) {
                 Style::default()
             };
             ListItem::new(format!(
-                "🌐 {}:{} {} {} {}",
-                port.protocol, port.port, port.process, port.local_address, port.state
+                "🌐 {}:{} {} {} {} [PID: {}]",
+                port.protocol, port.port, port.process, port.local_address, port.state, port.pid
             ))
             .style(style)
         })
         .collect();
 
+    let title = if app_state.port_filter_mode {
+        format!("Network Ports (Filter: '{}' | Press Enter to apply, Esc to cancel)", app_state.port_filter)
+    } else if app_state.port_filter.is_empty() {
+        "Network Ports (Press 'k' to kill, '/' to filter)".to_string()
+    } else {
+        format!("Network Ports (Filtered: '{}' | Press '/' to filter, Esc to clear)", app_state.port_filter)
+    };
+
     let list = List::new(items).block(
         Block::default()
-            .title("Network Ports")
+            .title(title)
             .borders(Borders::ALL),
     );
     f.render_widget(list, area);
@@ -722,6 +1089,7 @@ fn parse_lsof_line(line: &str) -> Option<PortInfo> {
         return None;
     }
 
+    let pid = parts.get(1).unwrap_or(&"-").to_string();
     let name_field = parts[8..].join(" ");
     let mut local_address = name_field.clone();
     let mut state = String::from("N/A");
@@ -746,6 +1114,7 @@ fn parse_lsof_line(line: &str) -> Option<PortInfo> {
         local_address,
         state,
         port,
+        pid,
     })
 }
 
